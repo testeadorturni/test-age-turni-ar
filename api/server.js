@@ -32,7 +32,7 @@ const CACHE_DURATION = 20_000;
 // FIX-SEC: JWT de 7 días bajado a 1 día. Reduce la ventana de exposición
 // si un token se filtra (XSS, dispositivo compartido, etc).
 const JWT_EXPIRY     = process.env.JWT_EXPIRY || "1d";
-const API_URL        = process.env.API_URL || "https://negosocio.onrender.com";
+const API_URL        = process.env.API_URL || "https://test-age-turni-ar.onrender.com";
 // Versión vigente del panel (componente de Framer). OPCIONAL: si no está
 // seteada, el panel solo usa la detección por huella de scripts. Ver
 // GET /panel-version más abajo.
