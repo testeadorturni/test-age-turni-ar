@@ -53,7 +53,7 @@ const MP_TOKEN_ENC_KEY   = process.env.MP_TOKEN_ENC_KEY           || "";
 if (!MP_TOKEN_ENC_KEY) {
   console.warn("⚠️  MP_TOKEN_ENC_KEY no configurada. Los tokens de Mercado Pago de los negocios NO se pueden cifrar/descifrar (falta la clave).");
 }
-const PANEL_URL          = process.env.PANEL_URL                  || "https://turnits.com/panel";
+const PANEL_URL          = process.env.PANEL_URL                  || "https://turnits.com/panel-test";
 const SUCCESS_URL        = process.env.SUCCESS_URL                || "https://turnits.com/success";
 const ERROR_URL          = process.env.ERROR_URL                  || "https://turnits.com/error";
 const RENOVACION_SUCCESS = process.env.RENOVACION_SUCCESS_URL     || `${PANEL_URL}?status=renovacion_ok`;
