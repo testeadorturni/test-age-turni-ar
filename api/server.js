@@ -897,6 +897,42 @@ function largoDescripcionServicio(descripcion) {
 }
 
 // ══════════════════════════════════════════════════════════════
+// COMPARATIVAS "Cómo venís respecto al período anterior" (panel)
+// Se compara el MISMO TRAMO de cada período, no el período completo anterior:
+// si hoy es el 20, el mes en curso (1 al 20) se compara contra el 1 al 20 del
+// mes pasado. Comparar contra el mes anterior entero haría que los primeros
+// días de cada mes siempre den "negativo". Lo mismo para la semana (lunes a
+// hoy vs. lunes al mismo día de la semana pasada).
+// Todo con fechas ISO "YYYY-MM-DD" (sin husos horarios de por medio).
+// ══════════════════════════════════════════════════════════════
+const sumarDiasISO = (iso, n) => {
+  const d = new Date(iso + "T12:00:00Z");
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+};
+
+function rangosComparativos(hoyISO) {
+  const ini = (iso) => iso.slice(0, 8) + "01";
+  const inicioMes    = ini(hoyISO);
+  const diaDelMes    = Number(hoyISO.slice(8, 10));
+  const finMesAnt    = sumarDiasISO(inicioMes, -1);
+  const inicioMesAnt = ini(finMesAnt);
+  // Si el mes pasado tuvo menos días (ej. hoy 31/3 vs febrero), se recorta al último día.
+  const hastaMesAnt  = (() => { const h = sumarDiasISO(inicioMesAnt, diaDelMes - 1); return h > finMesAnt ? finMesAnt : h; })();
+
+  const dow            = new Date(hoyISO + "T12:00:00Z").getUTCDay(); // 0 = domingo
+  const diasDesdeLunes = dow === 0 ? 6 : dow - 1;
+  const inicioSem      = sumarDiasISO(hoyISO, -diasDesdeLunes);
+  const inicioSemAnt   = sumarDiasISO(inicioSem, -7);
+  const hastaSemAnt    = sumarDiasISO(inicioSemAnt, diasDesdeLunes);
+
+  return {
+    mes:    { actual: { desde: inicioMes, hasta: hoyISO },    anterior: { desde: inicioMesAnt, hasta: hastaMesAnt } },
+    semana: { actual: { desde: inicioSem, hasta: hoyISO },    anterior: { desde: inicioSemAnt, hasta: hastaSemAnt } },
+  };
+}
+
+// ══════════════════════════════════════════════════════════════
 // HELPER: ENVIAR MAIL DE TURNO
 // ══════════════════════════════════════════════════════════════
 // FIX-SEÑA: se agrega "tipoCobro" (sena | total | null), separado de
@@ -4143,6 +4179,43 @@ const turnosHoyDetalle = turnosData
     // como métrica (sin cancelados ni pendientes). Días recurrentes: historial
     // completo de cada cliente, porque para saber si "volvió" hay que ver
     // sus turnos anteriores, no solo los de este mes.
+    // Comparativas mes / semana contra el mismo tramo del período anterior.
+    //  · turnos: mismo criterio que turnosMes (sin cancelados ni pendientes).
+    //    COUNT en la base, así no depende del tope de 1000 filas.
+    //  · ingresos: mismo criterio que ventas.volumenMes (por fecha de pago).
+    //  · clientes_nuevos: su primer turno histórico cae dentro del tramo
+    //    (fecha en horario de Argentina).
+    const fechaArgDe = (d) => d.toLocaleDateString("en-CA", { timeZone: "America/Argentina/Buenos_Aires" });
+    const contarTurnosRango = async (desde, hasta) => {
+      const { count, error } = await supabase.from("turnos").select("id", { count: "exact", head: true })
+        .eq("slug", slug).gte("fecha", desde).lte("fecha", hasta)
+        .not("estado", "in", "(cancelado,pendiente)");
+      if (error) throw error;
+      return count || 0;
+    };
+    const ingresosRango = (desde, hasta) => {
+      const cantDias = Math.round((new Date(hasta + "T12:00:00Z") - new Date(desde + "T12:00:00Z")) / 86400000) + 1;
+      return generarRangoDias(desde, cantDias).reduce((acc, d) => acc + Number(metricas.porDia[d]?.volumen || 0), 0);
+    };
+    const nuevosRango = (desde, hasta) =>
+      Object.values(primeraVezPorCliente).filter((f) => { const d = fechaArgDe(f); return d >= desde && d <= hasta; }).length;
+    const armarTramo = async ({ desde, hasta }) => ({
+      desde, hasta,
+      turnos:          await contarTurnosRango(desde, hasta),
+      clientes_nuevos: nuevosRango(desde, hasta),
+      ingresos:        ingresosRango(desde, hasta),
+    });
+
+    const rangosCmp = rangosComparativos(hoyISO);
+    const [mesActual_, mesAnterior_, semActual_, semAnterior_] = await Promise.all([
+      armarTramo(rangosCmp.mes.actual),    armarTramo(rangosCmp.mes.anterior),
+      armarTramo(rangosCmp.semana.actual), armarTramo(rangosCmp.semana.anterior),
+    ]);
+    const comparativas = {
+      mes:    { actual: mesActual_, anterior: mesAnterior_ },
+      semana: { actual: semActual_, anterior: semAnterior_ },
+    };
+
     const serviciosMasPedidos = calcularServiciosMasPedidos(turnosParaMetricas);
     const diasRecurrentes     = calcularDiasRecurrentes(todosLosTurnos);
 
@@ -4157,6 +4230,7 @@ const turnosHoyDetalle = turnosData
       clientesFrecuentes:        clientesFrecuentes,
       serviciosMasPedidos,
       diasRecurrentes,
+      comparativas,
       ventas: {
         volumenTotal:   metricas.volumenTotal,
         volumenHoy:     pagosHoy.volumen,
