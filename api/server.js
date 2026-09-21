@@ -4026,7 +4026,13 @@ app.get("/admin-stats/:slug", requireAuth, async (req, res) => {
 
     const [{ data: turnosMes }, { data: serviciosNegocio }, { count: turnosMesAnteriorTotal }] = await Promise.all([
       supabase.from("turnos").select("*")
-        .eq("slug", slug).gte("fecha", inicioMes).neq("estado", "cancelado")
+        // FIX-METRICA-MES: se agrega el tope en hoyISO para que "turnos este mes"
+        // cuente lo mismo acá que en `comparativas.mes` (WeeklySummary). Antes esta
+        // consulta no tenía límite superior y sumaba también los turnos ya
+        // reservados para lo que resta del mes, mientras que el comparador de
+        // mes/semana solo cuenta hasta hoy — dos números de "turnos del mes"
+        // distintos en el mismo panel.
+        .eq("slug", slug).gte("fecha", inicioMes).lte("fecha", hoyISO).neq("estado", "cancelado")
         .order("fecha", { ascending: true }).order("hora", { ascending: true }),
       supabase.from("servicios").select("id, duracion")
         .eq("slug", slug).eq("activo", "true"),
