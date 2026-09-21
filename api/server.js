@@ -1188,6 +1188,7 @@ app.post("/registro/verificar", limiterAuth, limiterCodigo, async (req, res) => 
     await supabase.from("registros_pendientes").delete().eq("email", emailClean);
 
     registrarReferido(nuevo, pendiente).catch((e) => console.error("Error registrando referido:", e.message));
+    asegurarReferralCode(nuevo.slug).catch((e) => console.error("Error generando referral_code:", e.message));
 
     try {
   await supabase.from("equipo").insert([{
@@ -5626,11 +5627,13 @@ async function progresoGrupoReferidos(referidorSlug, grupoNro) {
   const detalle = [];
   for (const m of miembros || []) {
     const { data: u } = await supabase.from("usuarios")
-      .select("slug, email, telefono").eq("slug", m.invitado_slug).maybeSingle();
+      .select("slug, email, telefono, business_name").eq("slug", m.invitado_slug).maybeSingle();
     if (!u) continue;
     const turnos = await contarTurnosValidos(u.slug, u.email, u.telefono);
     detalle.push({
       slug: u.slug,
+      negocio: u.business_name || null,
+      registrado_at: m.created_at,
       turnos: Math.min(turnos, REFERIDOS_TURNOS_MIN),
       completo: turnos >= REFERIDOS_TURNOS_MIN,
       premio_entregado: !!m.premio_entregado_at,
@@ -5794,7 +5797,7 @@ app.get("/referidos/:slug", requireAuth, async (req, res) => {
         completo: g.completo,
         faltan_invitados: Math.max(0, REFERIDOS_GRUPO_SIZE - g.detalle.length),
         premio_entregado: g.detalle.length > 0 && g.detalle.every((d) => d.premio_entregado),
-        miembros: g.detalle.map((d, i) => ({ label: `Negocio ${i + 1}`, turnos: d.turnos, completo: d.completo, propio: false })),
+        miembros: g.detalle.map((d, i) => ({ label: d.negocio || `Negocio ${i + 1}`, turnos: d.turnos, completo: d.completo, propio: false, registrado_at: d.registrado_at })),
       });
     }
 
@@ -5805,6 +5808,11 @@ app.get("/referidos/:slug", requireAuth, async (req, res) => {
       reglas: { grupo: REFERIDOS_GRUPO_SIZE, turnos_min: REFERIDOS_TURNOS_MIN, dias_premio: REFERIDOS_DIAS_PREMIO },
       como_invitado: comoInvitado,
       total_invitados: (invitados || []).length,
+      resumen: {
+        registrados: (invitados || []).length,
+        con_turnos:  grupos.reduce((n, g) => n + g.miembros.filter((m) => m.turnos > 0).length, 0),
+        completaron: grupos.reduce((n, g) => n + g.miembros.filter((m) => m.completo).length, 0),
+      },
       grupos,
     });
   } catch (e) {
