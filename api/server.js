@@ -5546,7 +5546,7 @@ app.post("/webhook/renovacion", async (req, res) => {
 //
 // Los negocios que se registran con el mismo código forman grupos de
 // REFERIDOS_GRUPO_SIZE (3). Cuando TODOS los del grupo tienen al menos
-// REFERIDOS_TURNOS_MIN (10) turnos reales, cada uno recibe
+// REFERIDOS_TURNOS_MIN (25) turnos reales, cada uno recibe
 // REFERIDOS_DIAS_PREMIO (30) días de Premium. El premio se entrega una
 // sola vez por invitado (referidos.premio_entregado_at).
 //
@@ -5558,11 +5558,15 @@ app.post("/webhook/renovacion", async (req, res) => {
 // Requiere correr referidos_migracion.sql en Supabase.
 // ══════════════════════════════════════════════════════════════
 const REFERIDOS_GRUPO_SIZE  = parseInt(process.env.REFERIDOS_GRUPO_SIZE  || "3");
-const REFERIDOS_TURNOS_MIN  = parseInt(process.env.REFERIDOS_TURNOS_MIN  || "10");
+const REFERIDOS_TURNOS_MIN  = parseInt(process.env.REFERIDOS_TURNOS_MIN  || "25");
 const REFERIDOS_DIAS_PREMIO = parseInt(process.env.REFERIDOS_DIAS_PREMIO || "30");
 // Página de registro donde llega el invitado (tiene que leer ?ref= y mandarlo
 // como "ref" a POST /registro/iniciar).
 const REFERIDOS_REGISTRO_URL = process.env.REFERIDOS_REGISTRO_URL || "https://turnits.com/register-test";
+
+// Para pruebas: permite que el invitado use el mismo teléfono/email que quien lo invita.
+// En producción dejar sin definir (evita que alguien se invite a sí mismo).
+const REFERIDOS_PERMITIR_MISMO_CONTACTO = process.env.REFERIDOS_PERMITIR_MISMO_CONTACTO === "true";
 
 const REF_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // sin 0/O/1/I
 
@@ -5710,22 +5714,28 @@ async function registrarReferido(nuevo, pendiente) {
   const code = normalizarReferralCode(pendiente?.referral_code);
   if (!code) return;
 
-  const { data: referidor } = await supabase.from("usuarios")
+  const { data: referidor, error: refErr } = await supabase.from("usuarios")
     .select("slug, email, telefono").eq("referral_code", code).maybeSingle();
-  if (!referidor || referidor.slug === nuevo.slug) return;
+  if (refErr) throw refErr;
+  if (!referidor) {
+    console.log(`⚠️  Referido ignorado: no existe ningún negocio con el código ${code} (${nuevo.slug})`);
+    return;
+  }
+  if (referidor.slug === nuevo.slug) return;
 
   const mismoEmail = referidor.email && nuevo.email &&
     String(referidor.email).toLowerCase() === String(nuevo.email).toLowerCase();
   const mismoTel = referidor.telefono && pendiente.telefono &&
     cleanPhone(String(referidor.telefono)) === cleanPhone(String(pendiente.telefono));
-  if (mismoEmail || mismoTel) {
-    console.log(`⚠️  Referido descartado (mismo email/teléfono que el referidor): ${nuevo.slug}`);
+  if ((mismoEmail || mismoTel) && !REFERIDOS_PERMITIR_MISMO_CONTACTO) {
+    console.log(`⚠️  Referido descartado: ${nuevo.slug} usa el mismo ${mismoTel ? "teléfono" : "email"} que el referidor ${referidor.slug}. (Para pruebas: REFERIDOS_PERMITIR_MISMO_CONTACTO=true)`);
     return;
   }
 
-  const { data: ultimo } = await supabase.from("referidos")
+  const { data: ultimo, error: ultErr } = await supabase.from("referidos")
     .select("grupo_nro").eq("referidor_slug", referidor.slug)
     .order("grupo_nro", { ascending: false }).limit(1).maybeSingle();
+  if (ultErr) throw ultErr; // p. ej. la tabla "referidos" no existe: correr la migración
   let grupoNro = ultimo?.grupo_nro || 1;
   if (ultimo) {
     const { count } = await supabase.from("referidos")
@@ -5772,8 +5782,9 @@ app.get("/referidos/:slug", requireAuth, async (req, res) => {
 
     // 1) Como invitado: el grupo al que pertenece
     let comoInvitado = null;
-    const { data: miRef } = await supabase.from("referidos")
+    const { data: miRef, error: miRefErr } = await supabase.from("referidos")
       .select("referidor_slug, grupo_nro").eq("invitado_slug", slug).maybeSingle();
+    if (miRefErr) throw miRefErr;
     if (miRef) {
       const g = await evaluarGrupoReferidos(miRef.referidor_slug, miRef.grupo_nro);
       const yo = g.detalle.find((d) => d.slug === slug);
@@ -5786,8 +5797,9 @@ app.get("/referidos/:slug", requireAuth, async (req, res) => {
     }
 
     // 2) Como referidor: sus grupos (los 12 más recientes)
-    const { data: invitados } = await supabase.from("referidos")
+    const { data: invitados, error: invErr } = await supabase.from("referidos")
       .select("grupo_nro").eq("referidor_slug", slug);
+    if (invErr) throw invErr;
     const nros = [...new Set((invitados || []).map((r) => r.grupo_nro))].sort((a, b) => b - a).slice(0, 12);
     const grupos = [];
     for (const nro of nros) {
