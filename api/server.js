@@ -835,6 +835,68 @@ function agruparPagos(turnos, hoyISO) {
 }
 
 // ══════════════════════════════════════════════════════════════
+// HELPERS DE MÉTRICAS — widgets del dashboard nuevo del panel
+//  · "Servicios más pedidos"        -> stats.serviciosMasPedidos
+//  · "¿Cuándo vuelven tus clientes?" -> stats.diasRecurrentes
+// Ambos devuelven [{ nombre, cantidad, porcentaje }] ordenado de mayor a menor.
+// ══════════════════════════════════════════════════════════════
+const NOMBRES_DIAS_SEMANA = ["Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"];
+
+// Cuenta reservas por servicio. `porcentaje` es sobre el total de turnos que
+// tienen servicio asignado (los turnos sin servicio no entran en la cuenta).
+function calcularServiciosMasPedidos(turnos, limite = 5) {
+  const conteo = {};
+  let total = 0;
+  (turnos || []).forEach((t) => {
+    const nombre = String(t.servicio_nombre || "").trim();
+    if (!nombre || nombre === "null") return;
+    conteo[nombre] = (conteo[nombre] || 0) + 1;
+    total += 1;
+  });
+  return Object.entries(conteo)
+    .map(([nombre, cantidad]) => ({ nombre, cantidad, porcentaje: Math.round((cantidad / total) * 100) }))
+    .sort((a, b) => b.cantidad - a.cantidad || a.nombre.localeCompare(b.nombre))
+    .slice(0, limite);
+}
+
+// Días de la semana en los que los clientes VUELVEN. Una "visita de retorno" es
+// cualquier turno de un cliente que no sea su primero (confirmado/completado).
+// Los pendientes de aprobación, cancelados y no-shows no cuentan como visita.
+// Los turnos cargados a mano (sin teléfono ni email) no se pueden atribuir a
+// un cliente, así que se ignoran.
+function calcularDiasRecurrentes(turnos) {
+  const ESTADOS_VISITA = ["confirmado", "completado"];
+  const porCliente = {};
+  (turnos || []).forEach((t) => {
+    if (!ESTADOS_VISITA.includes(t.estado) || !t.fecha) return;
+    const key = t.telefono || t.email?.toLowerCase();
+    if (!key) return;
+    if (!porCliente[key]) porCliente[key] = [];
+    porCliente[key].push(`${t.fecha} ${(t.hora || "").slice(0, 5)}`);
+  });
+
+  const cantidadPorDia = {};
+  let total = 0;
+  Object.values(porCliente).forEach((visitas) => {
+    visitas.sort().slice(1).forEach((f) => {   // se descarta la primera visita
+      const dia = new Date(f.slice(0, 10) + "T12:00:00").getDay();
+      cantidadPorDia[dia] = (cantidadPorDia[dia] || 0) + 1;
+      total += 1;
+    });
+  });
+
+  return Object.entries(cantidadPorDia)
+    .map(([dia, cantidad]) => ({ nombre: NOMBRES_DIAS_SEMANA[dia], cantidad, porcentaje: Math.round((cantidad / total) * 100) }))
+    .sort((a, b) => b.cantidad - a.cantidad || a.nombre.localeCompare(b.nombre));
+}
+
+// El panel guarda la imagen del servicio DENTRO de la descripción con el
+// formato "[img:URL]texto". Para el límite de largo se mide solo el texto.
+function largoDescripcionServicio(descripcion) {
+  return String(descripcion ?? "").replace(/^\[img:.*?\]/s, "").length;
+}
+
+// ══════════════════════════════════════════════════════════════
 // HELPER: ENVIAR MAIL DE TURNO
 // ══════════════════════════════════════════════════════════════
 // FIX-SEÑA: se agrega "tipoCobro" (sena | total | null), separado de
@@ -1892,7 +1954,7 @@ app.post("/admin/servicios", requireAuth, async (req, res) => {
 
     const errorValidacion = validarServicioBody({ nombre, precio });
     if (errorValidacion) return res.status(400).json({ success: false, error: errorValidacion });
-    if (descripcion !== undefined && descripcion !== null && String(descripcion).length > 1000) {
+    if (descripcion !== undefined && descripcion !== null && largoDescripcionServicio(descripcion) > 1000) {
       return res.status(400).json({ success: false, error: "La descripción es demasiado larga." });
     }
 
@@ -1942,7 +2004,7 @@ app.put("/admin/servicios/:id", requireAuth, async (req, res) => {
       update.precio = p;
     }
     if (descripcion !== undefined) {
-      if (descripcion !== null && String(descripcion).length > 1000) {
+      if (descripcion !== null && largoDescripcionServicio(descripcion) > 1000) {
         return res.status(400).json({ success: false, error: "La descripción es demasiado larga." });
       }
       update.descripcion = descripcion?.trim() || null;
@@ -3144,6 +3206,8 @@ app.get("/agenda/:slug", requireAuth, async (req, res) => {
         apellido:       t.apellido || null,
         hora:           t.hora.slice(0, 5),
         servicio:       t.servicio_nombre || null,
+        equipo_id:      t.equipo_id       || null,
+        equipo_nombre:  t.equipo_nombre   || null,
         precio_cobrado: t.precio_cobrado  || 0,
         monto_pagado:   t.monto_pagado    || 0,
         monto_pendiente_local: Math.max((t.precio_cobrado || 0) - (t.monto_pagado || 0), 0),
@@ -4015,7 +4079,7 @@ const turnosHoyDetalle = turnosData
     }));
 
     const { data: todosLosTurnos } = await supabase.from("turnos")
-      .select("telefono, email, created_at").eq("slug", slug).neq("estado", "cancelado");
+      .select("telefono, email, created_at, fecha, hora, estado").eq("slug", slug).neq("estado", "cancelado");
     const inicioMesDate = new Date(inicioMes + "T00:00:00");
 
     // Métricas de clientes reales.
@@ -4056,14 +4120,31 @@ const turnosHoyDetalle = turnosData
       if (cantidad >= 3) clientesFrecuentes++;
     });
 
+    // El panel grafica ingresos de los últimos 7/30 días y arma un sparkline: si
+    // solo se mandaba el mes en curso, en los primeros días del mes todo lo
+    // anterior llegaba en cero. Se cubre el mes actual O los últimos 30 días,
+    // lo que sea más largo.
+    const hace29 = new Date(hoyISO + "T12:00:00");
+    hace29.setDate(hace29.getDate() - 29);
+    const hace29ISO    = hace29.toISOString().split("T")[0];
+    const inicioVentas = hace29ISO < inicioMes ? hace29ISO : inicioMes;
+    const diasVentas   = Math.round((new Date(hoyISO + "T12:00:00") - new Date(inicioVentas + "T12:00:00")) / 86400000) + 1;
+
     const pagosPorDia = {};
-    generarRangoDias(inicioMes, diaHoyNum).forEach((d) => {
+    generarRangoDias(inicioVentas, diasVentas).forEach((d) => {
       pagosPorDia[d] = metricas.porDia[d] || { volumen: 0, cantidad: 0, aprobado: 0, pendiente: 0, rechazado: 0 };
     });
 
     const diasRestantes      = user.fecha_vencimiento ? diasHastaVencer(user.fecha_vencimiento) : null;
     const estadoSuscripcion  = user.estado_suscripcion || "trial";
     const suscripcionVencida = diasRestantes !== null && diasRestantes <= 0;
+
+    // Widgets del dashboard nuevo. Servicios: solo turnos del mes que cuentan
+    // como métrica (sin cancelados ni pendientes). Días recurrentes: historial
+    // completo de cada cliente, porque para saber si "volvió" hay que ver
+    // sus turnos anteriores, no solo los de este mes.
+    const serviciosMasPedidos = calcularServiciosMasPedidos(turnosParaMetricas);
+    const diasRecurrentes     = calcularDiasRecurrentes(todosLosTurnos);
 
     const finalData = {
       turnosHoy, turnosMes: turnosMesTotal, turnosMesAnterior: turnosMesAnteriorTotal || 0, turnosHoyDetalle,
@@ -4074,6 +4155,8 @@ const turnosHoyDetalle = turnosData
       clientesNuevosMesAnterior: clientesNuevosMesAnterior,
       clientesRecurrentes:       clientesRecurrentes,
       clientesFrecuentes:        clientesFrecuentes,
+      serviciosMasPedidos,
+      diasRecurrentes,
       ventas: {
         volumenTotal:   metricas.volumenTotal,
         volumenHoy:     pagosHoy.volumen,
@@ -4130,6 +4213,31 @@ const turnosHoyDetalle = turnosData
 // pendientes de aprobación (transferencia/efectivo sin confirmar),
 // porque todavía no representan trabajo realizado ni cobrado.
 // ══════════════════════════════════════════════════════════════
+const PERIODOS_RENDIMIENTO = ["dia", "semana", "mes"];
+
+// Rango de fechas (ISO, ambos inclusivos) de "hoy" / esta semana (lunes a
+// domingo) / este mes, según el horario de Argentina. Lo comparten
+// /admin/rendimiento-equipo y /admin/rendimiento-equipo-resumen.
+function rangoPeriodoArg(periodo) {
+  const ahoraArg = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Argentina/Buenos_Aires" }));
+  const fmtISO = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+
+  if (periodo === "dia") {
+    const hoy = fmtISO(ahoraArg);
+    return { desde: hoy, hasta: hoy };
+  }
+  if (periodo === "semana") {
+    const diaSemana   = ahoraArg.getDay(); // 0 = domingo
+    const offsetLunes = diaSemana === 0 ? -6 : 1 - diaSemana;
+    const lunes   = new Date(ahoraArg); lunes.setDate(ahoraArg.getDate() + offsetLunes);
+    const domingo = new Date(lunes);    domingo.setDate(lunes.getDate() + 6);
+    return { desde: fmtISO(lunes), hasta: fmtISO(domingo) };
+  }
+  const primerDia = new Date(ahoraArg.getFullYear(), ahoraArg.getMonth(), 1);
+  const ultimoDia = new Date(ahoraArg.getFullYear(), ahoraArg.getMonth() + 1, 0);
+  return { desde: fmtISO(primerDia), hasta: fmtISO(ultimoDia) };
+}
+
 app.get("/admin/rendimiento-equipo/:slug", requireAuth, async (req, res) => {
   try {
     const slug = cleanSlug(req.params.slug);
@@ -4161,26 +4269,7 @@ app.get("/admin/rendimiento-equipo/:slug", requireAuth, async (req, res) => {
     if (equipoError) throw equipoError;
     if (!integrante) return res.status(404).json({ success: false, error: "Integrante no encontrado." });
 
-    // "Hoy" en horario de Argentina, igual criterio que /admin-stats.
-    const ahoraArg = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Argentina/Buenos_Aires" }));
-    const fmtISO = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-
-    let desde, hasta;
-    if (periodo === "dia") {
-      desde = hasta = fmtISO(ahoraArg);
-    } else if (periodo === "semana") {
-      const diaSemana   = ahoraArg.getDay(); // 0 = domingo
-      const offsetLunes = diaSemana === 0 ? -6 : 1 - diaSemana;
-      const lunes   = new Date(ahoraArg); lunes.setDate(ahoraArg.getDate() + offsetLunes);
-      const domingo = new Date(lunes);    domingo.setDate(lunes.getDate() + 6);
-      desde = fmtISO(lunes);
-      hasta = fmtISO(domingo);
-    } else {
-      const primerDia = new Date(ahoraArg.getFullYear(), ahoraArg.getMonth(), 1);
-      const ultimoDia = new Date(ahoraArg.getFullYear(), ahoraArg.getMonth() + 1, 0);
-      desde = fmtISO(primerDia);
-      hasta = fmtISO(ultimoDia);
-    }
+    const { desde, hasta } = rangoPeriodoArg(periodo);
 
     const { data: turnosPeriodo, error: turnosError } = await supabase.from("turnos")
       .select("id, fecha, hora, estado, servicio_nombre, nombre, apellido, precio_cobrado")
@@ -4216,6 +4305,107 @@ app.get("/admin/rendimiento-equipo/:slug", requireAuth, async (req, res) => {
   } catch (e) {
     console.error("Error en /admin/rendimiento-equipo:", e.message);
     res.status(500).json({ success: false, error: "Error al obtener el rendimiento del integrante." });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+// RENDIMIENTO DEL EQUIPO — RESUMEN DE TODOS LOS INTEGRANTES (Premium)
+// GET /admin/rendimiento-equipo-resumen/:slug?periodo=dia|semana|mes
+//
+// Lo consume el panel lateral del dashboard ("Rendimiento por profesional").
+// Devuelve una fila por cada integrante ACTIVO (también los que no tuvieron
+// actividad en el período: el panel los muestra como "Sin actividad") y los
+// totales. Mismo criterio de "turno contable" que /admin-stats y
+// /admin/rendimiento-equipo: sin cancelados ni pendientes de aprobación.
+//
+// Los turnos sin profesional asignado (ej. negocios de una sola persona, donde
+// el widget salta el paso "elegir profesional", o turnos cargados a mano) no se
+// le atribuyen a nadie: no suman a ningún integrante ni a `totales` (así los
+// porcentajes de la barra del panel cierran contra el total mostrado) y se
+// informan aparte en `sin_asignar`.
+// ══════════════════════════════════════════════════════════════
+app.get("/admin/rendimiento-equipo-resumen/:slug", requireAuth, async (req, res) => {
+  try {
+    const slug = cleanSlug(req.params.slug);
+    if (!slug) return res.status(400).json({ success: false, error: "Slug inválido." });
+
+    // El panel arranca en "mes" si no se elige otro período.
+    const periodo = PERIODOS_RENDIMIENTO.includes(req.query.periodo) ? req.query.periodo : "mes";
+
+    const { data: user, error: userError } = await supabase.from("usuarios")
+      .select("plan").eq("slug", slug).maybeSingle();
+    if (userError) throw userError;
+    if (!user) return res.status(404).json({ success: false, error: "Negocio no encontrado." });
+
+    if (user.plan !== "premium") {
+      return res.status(403).json({
+        success: false,
+        error: "premium_required",
+        mensaje: "El rendimiento por integrante es una función Premium.",
+      });
+    }
+
+    const { desde, hasta } = rangoPeriodoArg(periodo);
+
+    const { data: equipo, error: equipoError } = await supabase.from("equipo")
+      .select("id, nombre, apellido, rol")
+      .eq("slug", slug).eq("activo", true)
+      .order("es_dueño", { ascending: false }).order("created_at", { ascending: true });
+    if (equipoError) throw equipoError;
+
+    // PostgREST corta en 1000 filas por consulta: se pagina para que un mes de
+    // un negocio grande con varios profesionales no quede truncado.
+    const turnos = [];
+    for (let pagina = 0; pagina < 50; pagina++) {
+      const { data: lote, error: turnosError } = await supabase.from("turnos")
+        .select("id, equipo_id, estado, precio_cobrado")
+        .eq("slug", slug).gte("fecha", desde).lte("fecha", hasta)
+        .neq("estado", "cancelado")
+        .order("id", { ascending: true })
+        .range(pagina * 1000, pagina * 1000 + 999);
+      if (turnosError) throw turnosError;
+      turnos.push(...(lote || []));
+      if (!lote || lote.length < 1000) break;
+    }
+
+    const acumulado = new Map((equipo || []).map((m) => [m.id, { turnos: 0, facturacion: 0 }]));
+    const sinAsignar = { turnos: 0, facturacion: 0 };
+
+    turnos.filter((t) => t.estado !== "pendiente").forEach((t) => {
+      const monto = Number(t.precio_cobrado || 0);
+      const fila  = t.equipo_id ? acumulado.get(t.equipo_id) : null;
+      const destino = fila || sinAsignar;   // sin profesional, o profesional ya desactivado
+      destino.turnos      += 1;
+      destino.facturacion += monto;
+    });
+
+    const integrantes = (equipo || []).map((m) => {
+      const a = acumulado.get(m.id);
+      return {
+        id: m.id, nombre: m.nombre, apellido: m.apellido || null, rol: m.rol,
+        turnos: a.turnos,
+        facturacion: a.facturacion,
+        ticket_promedio: a.turnos > 0 ? Math.round(a.facturacion / a.turnos) : 0,
+      };
+    }).sort((x, y) => y.facturacion - x.facturacion || y.turnos - x.turnos);   // sort estable: empates conservan el orden dueño -> antigüedad
+
+    const totalTurnos      = integrantes.reduce((acc, m) => acc + m.turnos, 0);
+    const totalFacturacion = integrantes.reduce((acc, m) => acc + m.facturacion, 0);
+
+    res.json({
+      success: true,
+      periodo, desde, hasta,
+      integrantes,
+      totales: {
+        turnos: totalTurnos,
+        facturacion: totalFacturacion,
+        ticket_promedio: totalTurnos > 0 ? Math.round(totalFacturacion / totalTurnos) : 0,
+      },
+      sin_asignar: sinAsignar,
+    });
+  } catch (e) {
+    console.error("Error en /admin/rendimiento-equipo-resumen:", e.message);
+    res.status(500).json({ success: false, error: "Error al obtener el resumen del equipo." });
   }
 });
 
