@@ -5562,7 +5562,7 @@ const REFERIDOS_TURNOS_MIN  = parseInt(process.env.REFERIDOS_TURNOS_MIN  || "10"
 const REFERIDOS_DIAS_PREMIO = parseInt(process.env.REFERIDOS_DIAS_PREMIO || "30");
 // Página de registro donde llega el invitado (tiene que leer ?ref= y mandarlo
 // como "ref" a POST /registro/iniciar).
-const REFERIDOS_REGISTRO_URL = process.env.REFERIDOS_REGISTRO_URL || "https://turnits.com/registro";
+const REFERIDOS_REGISTRO_URL = process.env.REFERIDOS_REGISTRO_URL || "https://turnits.com/register-test";
 
 const REF_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // sin 0/O/1/I
 
