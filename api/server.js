@@ -1042,7 +1042,7 @@ app.get("/panel-version", (_, res) => res.json({ success: true, version: PANEL_V
 // ══════════════════════════════════════════════════════════════
 app.post("/registro/iniciar", limiterAuth, async (req, res) => {
   try {
-    const { nombre_persona, apellido, email, telefono, business_name, password, horarios, duracion_turno, plan } = req.body;
+    const { nombre_persona, apellido, email, telefono, business_name, password, horarios, duracion_turno, plan, ref } = req.body;
 
     if (!nombre_persona || !email || !password || !business_name)
       return res.status(400).json({ success: false, error: "Faltan campos obligatorios." });
@@ -1084,6 +1084,7 @@ app.post("/registro/iniciar", limiterAuth, async (req, res) => {
       business_name:  business_name.trim(),
       password_hash,
       plan:           plan === "premium" ? "premium" : "gratis",
+      referral_code:  normalizarReferralCode(ref),
       horarios:       horarios && typeof horarios === "object" ? horarios : null,
       duracion_turno: parseInt(duracion_turno) || 30,
       codigo,
@@ -1185,6 +1186,8 @@ app.post("/registro/verificar", limiterAuth, limiterCodigo, async (req, res) => 
     }
 
     await supabase.from("registros_pendientes").delete().eq("email", emailClean);
+
+    registrarReferido(nuevo, pendiente).catch((e) => console.error("Error registrando referido:", e.message));
 
     try {
   await supabase.from("equipo").insert([{
@@ -5000,6 +5003,7 @@ app.post("/renovacion/downgrade/:slug", requireAuth, async (req, res) => {
       metodo_pago:          "total",
       acepta_transferencia: false,
       acepta_efectivo:      false,
+      premium_promo:        false,
     }).eq("slug", slug);
 
     if (updateError) throw updateError;
@@ -5499,7 +5503,7 @@ async function procesarRenovacion(payData) {
   const fechaBase  = user.fecha_vencimiento && new Date(user.fecha_vencimiento) > new Date() ? user.fecha_vencimiento : null;
   const nuevaFecha = calcularVencimiento(30, fechaBase);
 
-  await supabase.from("usuarios").update({ fecha_vencimiento: nuevaFecha, estado_suscripcion: "activo", plan: "premium" }).eq("slug", slug);
+  await supabase.from("usuarios").update({ fecha_vencimiento: nuevaFecha, estado_suscripcion: "activo", plan: "premium", premium_promo: false }).eq("slug", slug);
   invalidateCache(slug);
   console.log(`✅ Renovación aprobada: ${slug} → vence ${nuevaFecha}`);
 
@@ -5537,6 +5541,303 @@ app.post("/webhook/renovacion", async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════
+// PROGRAMA DE REFERIDOS
+//
+// Los negocios que se registran con el mismo código forman grupos de
+// REFERIDOS_GRUPO_SIZE (3). Cuando TODOS los del grupo tienen al menos
+// REFERIDOS_TURNOS_MIN (10) turnos reales, cada uno recibe
+// REFERIDOS_DIAS_PREMIO (30) días de Premium. El premio se entrega una
+// sola vez por invitado (referidos.premio_entregado_at).
+//
+// "Turno real" = confirmado/completado, con teléfono o email del cliente,
+// que no sea del propio dueño, y que ya pasó (o esté completado). Así no
+// valen los turnos cargados a mano por el dueño ni las reservas de prueba
+// hechas con sus propios datos.
+//
+// Requiere correr referidos_migracion.sql en Supabase.
+// ══════════════════════════════════════════════════════════════
+const REFERIDOS_GRUPO_SIZE  = parseInt(process.env.REFERIDOS_GRUPO_SIZE  || "3");
+const REFERIDOS_TURNOS_MIN  = parseInt(process.env.REFERIDOS_TURNOS_MIN  || "10");
+const REFERIDOS_DIAS_PREMIO = parseInt(process.env.REFERIDOS_DIAS_PREMIO || "30");
+// Página de registro donde llega el invitado (tiene que leer ?ref= y mandarlo
+// como "ref" a POST /registro/iniciar).
+const REFERIDOS_REGISTRO_URL = process.env.REFERIDOS_REGISTRO_URL || "https://turnits.com/registro";
+
+const REF_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // sin 0/O/1/I
+
+function generarReferralCode() {
+  const bytes = crypto.randomBytes(8);
+  return Array.from(bytes, (b) => REF_ALPHABET[b % REF_ALPHABET.length]).join("");
+}
+
+function normalizarReferralCode(raw) {
+  const c = String(raw || "").trim().toUpperCase();
+  return /^[A-Z0-9]{6,12}$/.test(c) ? c : null;
+}
+
+async function asegurarReferralCode(slug) {
+  const { data: u, error } = await supabase.from("usuarios")
+    .select("referral_code").eq("slug", slug).maybeSingle();
+  if (error) throw error;
+  if (!u) return null;
+  if (u.referral_code) return u.referral_code;
+
+  for (let i = 0; i < 5; i++) {
+    const { error: upErr } = await supabase.from("usuarios")
+      .update({ referral_code: generarReferralCode() })
+      .eq("slug", slug).is("referral_code", null);
+    if (!upErr) break;
+    if (upErr.code !== "23505") throw upErr; // 23505 = código repetido, reintenta
+  }
+  const { data: u2 } = await supabase.from("usuarios")
+    .select("referral_code").eq("slug", slug).maybeSingle();
+  return u2?.referral_code || null;
+}
+
+async function contarTurnosValidos(slug, emailDueno, telefonoDueno) {
+  const ahoraArg = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Argentina/Buenos_Aires" }));
+  const hoyISO   = ahoraArg.toISOString().split("T")[0];
+
+  const { data, error } = await supabase.from("turnos")
+    .select("estado, fecha, email, telefono")
+    .eq("slug", slug).in("estado", ["confirmado", "completado"]).limit(1000);
+  if (error) throw error;
+
+  const emailD = String(emailDueno || "").trim().toLowerCase();
+  const telD   = telefonoDueno ? cleanPhone(String(telefonoDueno)) : "";
+
+  return (data || []).filter((t) => {
+    const email = String(t.email || "").trim().toLowerCase();
+    const tel   = t.telefono ? cleanPhone(String(t.telefono)) : "";
+    if (!email && !tel) return false;                                  // turno cargado a mano
+    if ((emailD && email === emailD) || (telD && tel === telD)) return false; // el dueño reservándose
+    return t.estado === "completado" || String(t.fecha).slice(0, 10) < hoyISO;
+  }).length;
+}
+
+// Estado de un grupo: [{ slug, turnos, completo, premio_entregado }]
+async function progresoGrupoReferidos(referidorSlug, grupoNro) {
+  const { data: miembros, error } = await supabase.from("referidos")
+    .select("invitado_slug, premio_entregado_at, created_at")
+    .eq("referidor_slug", referidorSlug).eq("grupo_nro", grupoNro)
+    .order("created_at", { ascending: true });
+  if (error) throw error;
+
+  const detalle = [];
+  for (const m of miembros || []) {
+    const { data: u } = await supabase.from("usuarios")
+      .select("slug, email, telefono").eq("slug", m.invitado_slug).maybeSingle();
+    if (!u) continue;
+    const turnos = await contarTurnosValidos(u.slug, u.email, u.telefono);
+    detalle.push({
+      slug: u.slug,
+      turnos: Math.min(turnos, REFERIDOS_TURNOS_MIN),
+      completo: turnos >= REFERIDOS_TURNOS_MIN,
+      premio_entregado: !!m.premio_entregado_at,
+    });
+  }
+  return detalle;
+}
+
+async function otorgarMesGratis(slug) {
+  const { data: u, error } = await supabase.from("usuarios")
+    .select("id, email, nombre_persona, plan, estado_suscripcion, fecha_vencimiento")
+    .eq("slug", slug).maybeSingle();
+  if (error) throw error;
+  if (!u) return;
+
+  const vigente    = u.fecha_vencimiento && new Date(u.fecha_vencimiento) > new Date();
+  const nuevaFecha = calcularVencimiento(REFERIDOS_DIAS_PREMIO, vigente ? u.fecha_vencimiento : null);
+  const eraPremium = u.plan === "premium";
+
+  const upd = {
+    plan: "premium",
+    // Un Premium en trial sigue en trial (el fee de MP depende de eso).
+    estado_suscripcion: eraPremium && u.estado_suscripcion === "trial" ? "trial" : "activo",
+    fecha_vencimiento: nuevaFecha,
+  };
+  if (!eraPremium) upd.premium_promo = true; // al vencer vuelve a gratis, no se suspende
+
+  const { error: upErr } = await supabase.from("usuarios").update(upd).eq("slug", slug);
+  if (upErr) throw upErr;
+  invalidateCache(slug);
+
+  crearNotificacion({
+    slug,
+    tipo: "sistema",
+    titulo: "¡Ganaste 1 mes de Premium!",
+    mensaje: `Tu grupo de referidos completó los ${REFERIDOS_TURNOS_MIN} turnos. Tu Premium gratis vence el ${nuevaFecha}.`,
+    data: { nuevaFecha, seccion: "pagos", clave: "referidos_premio" },
+  });
+  console.log(`🎁 Referidos: +${REFERIDOS_DIAS_PREMIO} días Premium para ${slug} (vence ${nuevaFecha})`);
+}
+
+// Si los 3 llegaron a la meta, entrega el premio a los que todavía no lo tienen.
+// El "claim" (update ... WHERE premio_entregado_at IS NULL) hace que dos
+// ejecuciones simultáneas (cron + panel) nunca den el mes dos veces.
+async function evaluarGrupoReferidos(referidorSlug, grupoNro) {
+  const detalle  = await progresoGrupoReferidos(referidorSlug, grupoNro);
+  const completo = detalle.length >= REFERIDOS_GRUPO_SIZE && detalle.every((d) => d.completo);
+  if (!completo) return { completo: false, detalle, entregados: [] };
+
+  const entregados = [];
+  for (const d of detalle) {
+    if (d.premio_entregado) continue;
+    const { data: claim, error } = await supabase.from("referidos")
+      .update({ premio_entregado_at: new Date().toISOString() })
+      .eq("invitado_slug", d.slug).is("premio_entregado_at", null)
+      .select("invitado_slug");
+    if (error || !claim?.length) continue; // otro proceso ya lo reclamó
+
+    try {
+      await otorgarMesGratis(d.slug);
+      d.premio_entregado = true;
+      entregados.push(d.slug);
+    } catch (e) {
+      console.error(`Error entregando premio de referidos a ${d.slug}:`, e.message);
+      // se devuelve el claim para que el próximo intento lo reintente
+      await supabase.from("referidos").update({ premio_entregado_at: null }).eq("invitado_slug", d.slug);
+    }
+  }
+  return { completo: true, detalle, entregados };
+}
+
+// Se llama al verificar el registro: si vino con un código válido, lo asigna a un grupo.
+async function registrarReferido(nuevo, pendiente) {
+  const code = normalizarReferralCode(pendiente?.referral_code);
+  if (!code) return;
+
+  const { data: referidor } = await supabase.from("usuarios")
+    .select("slug, email, telefono").eq("referral_code", code).maybeSingle();
+  if (!referidor || referidor.slug === nuevo.slug) return;
+
+  const mismoEmail = referidor.email && nuevo.email &&
+    String(referidor.email).toLowerCase() === String(nuevo.email).toLowerCase();
+  const mismoTel = referidor.telefono && pendiente.telefono &&
+    cleanPhone(String(referidor.telefono)) === cleanPhone(String(pendiente.telefono));
+  if (mismoEmail || mismoTel) {
+    console.log(`⚠️  Referido descartado (mismo email/teléfono que el referidor): ${nuevo.slug}`);
+    return;
+  }
+
+  const { data: ultimo } = await supabase.from("referidos")
+    .select("grupo_nro").eq("referidor_slug", referidor.slug)
+    .order("grupo_nro", { ascending: false }).limit(1).maybeSingle();
+  let grupoNro = ultimo?.grupo_nro || 1;
+  if (ultimo) {
+    const { count } = await supabase.from("referidos")
+      .select("id", { count: "exact", head: true })
+      .eq("referidor_slug", referidor.slug).eq("grupo_nro", grupoNro);
+    if ((count || 0) >= REFERIDOS_GRUPO_SIZE) grupoNro += 1;
+  }
+
+  const { error } = await supabase.from("referidos").insert([{
+    referidor_slug: referidor.slug, invitado_slug: nuevo.slug, grupo_nro: grupoNro,
+  }]);
+  if (error) throw error;
+
+  crearNotificacion({
+    slug: referidor.slug,
+    tipo: "sistema",
+    titulo: "Se sumó un negocio con tu código",
+    mensaje: "Alguien se registró en Turnits con tu código de referidos. Mirá el avance en Crecer.",
+    data: { clave: "referido_nuevo", seccion: "inicio" },
+  });
+  crearNotificacion({
+    slug: nuevo.slug,
+    tipo: "sistema",
+    titulo: "Tenés 1 mes de Premium en juego",
+    mensaje: `Cuando los ${REFERIDOS_GRUPO_SIZE} negocios de tu grupo lleguen a ${REFERIDOS_TURNOS_MIN} turnos, cada uno gana ${REFERIDOS_DIAS_PREMIO} días de Premium.`,
+    data: { clave: "referido_bienvenida", seccion: "inicio" },
+  });
+  console.log(`🤝 Referido: ${nuevo.slug} → ${referidor.slug} (grupo ${grupoNro})`);
+}
+
+// GET /referidos/:slug — datos para la tarjeta del panel
+app.get("/referidos/:slug", requireAuth, async (req, res) => {
+  try {
+    const slug   = cleanSlug(req.params.slug);
+    const codigo = await asegurarReferralCode(slug);
+    if (!codigo) return res.status(404).json({ success: false, error: "Negocio no encontrado." });
+
+    const etiquetar = (detalle) => detalle.map((d, i) => ({
+      label: d.slug === slug ? "Tu negocio" : `Negocio ${i + 1}`,
+      turnos: d.turnos,
+      completo: d.completo,
+      propio: d.slug === slug,
+    }));
+
+    // 1) Como invitado: el grupo al que pertenece
+    let comoInvitado = null;
+    const { data: miRef } = await supabase.from("referidos")
+      .select("referidor_slug, grupo_nro").eq("invitado_slug", slug).maybeSingle();
+    if (miRef) {
+      const g = await evaluarGrupoReferidos(miRef.referidor_slug, miRef.grupo_nro);
+      const yo = g.detalle.find((d) => d.slug === slug);
+      comoInvitado = {
+        completo: g.completo,
+        faltan_invitados: Math.max(0, REFERIDOS_GRUPO_SIZE - g.detalle.length),
+        premio_entregado: !!yo?.premio_entregado,
+        miembros: etiquetar(g.detalle),
+      };
+    }
+
+    // 2) Como referidor: sus grupos (los 12 más recientes)
+    const { data: invitados } = await supabase.from("referidos")
+      .select("grupo_nro").eq("referidor_slug", slug);
+    const nros = [...new Set((invitados || []).map((r) => r.grupo_nro))].sort((a, b) => b - a).slice(0, 12);
+    const grupos = [];
+    for (const nro of nros) {
+      const g = await evaluarGrupoReferidos(slug, nro);
+      grupos.push({
+        nro,
+        completo: g.completo,
+        faltan_invitados: Math.max(0, REFERIDOS_GRUPO_SIZE - g.detalle.length),
+        premio_entregado: g.detalle.length > 0 && g.detalle.every((d) => d.premio_entregado),
+        miembros: g.detalle.map((d, i) => ({ label: `Negocio ${i + 1}`, turnos: d.turnos, completo: d.completo, propio: false })),
+      });
+    }
+
+    res.json({
+      success: true,
+      codigo,
+      link: `${REFERIDOS_REGISTRO_URL}?ref=${codigo}`,
+      reglas: { grupo: REFERIDOS_GRUPO_SIZE, turnos_min: REFERIDOS_TURNOS_MIN, dias_premio: REFERIDOS_DIAS_PREMIO },
+      como_invitado: comoInvitado,
+      total_invitados: (invitados || []).length,
+      grupos,
+    });
+  } catch (e) {
+    console.error("Error en GET /referidos:", e.message);
+    res.status(500).json({ success: false, error: "No se pudo cargar el programa de referidos." });
+  }
+});
+
+// CRON — evalúa todos los grupos con premios pendientes (1 vez por día alcanza).
+app.get("/cron/referidos", requireAdminKey, async (req, res) => {
+  try {
+    const { data: pend, error } = await supabase.from("referidos")
+      .select("referidor_slug, grupo_nro").is("premio_entregado_at", null);
+    if (error) throw error;
+
+    const claves = [...new Set((pend || []).map((r) => `${r.referidor_slug}|${r.grupo_nro}`))];
+    const entregados = [];
+    for (const k of claves) {
+      const [ref, nro] = k.split("|");
+      try {
+        const r = await evaluarGrupoReferidos(ref, parseInt(nro));
+        entregados.push(...r.entregados);
+      } catch (e) {
+        console.error(`Cron referidos: falló el grupo ${k}:`, e.message);
+      }
+    }
+    res.json({ success: true, grupos_revisados: claves.length, premios_entregados: entregados });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
 // CRON — Verificación de vencimientos
 // ══════════════════════════════════════════════════════════════
 app.get("/cron/check-vencimientos", requireAdminKey, async (req, res) => {
@@ -5544,11 +5845,23 @@ app.get("/cron/check-vencimientos", requireAdminKey, async (req, res) => {
     const hoyISO = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Argentina/Buenos_Aires" })).toISOString().split("T")[0];
 
     const { data: vencidos, error } = await supabase.from("usuarios")
-      .select("id, slug").eq("activo", "true").neq("estado_suscripcion", "suspendido")
+      .select("id, slug, premium_promo").eq("activo", "true").neq("estado_suscripcion", "suspendido")
       .not("fecha_vencimiento", "is", null).lt("fecha_vencimiento", hoyISO);
     if (error) throw error;
 
-    const slugs = (vencidos || []).map((u) => u.slug);
+    // REFERIDOS: quien tenía Premium solo por el mes de regalo vuelve al plan
+    // gratis (igual que /renovacion/downgrade) en vez de quedar suspendido.
+    const promoVencidos = (vencidos || []).filter((u) => u.premium_promo).map((u) => u.slug);
+    if (promoVencidos.length > 0) {
+      await supabase.from("usuarios").update({
+        plan: "gratis", estado_suscripcion: "activo", fecha_vencimiento: null,
+        metodo_pago: "total", acepta_transferencia: false, acepta_efectivo: false,
+        premium_promo: false,
+      }).in("slug", promoVencidos);
+      promoVencidos.forEach((s) => invalidateCache(s));
+    }
+
+    const slugs = (vencidos || []).filter((u) => !u.premium_promo).map((u) => u.slug);
     if (slugs.length > 0) {
       await supabase.from("usuarios").update({ estado_suscripcion: "suspendido" }).in("slug", slugs);
       slugs.forEach((s) => invalidateCache(s));
