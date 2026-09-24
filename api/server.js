@@ -4494,6 +4494,87 @@ app.get("/admin/rendimiento-equipo-resumen/:slug", requireAuth, async (req, res)
 });
 
 // ══════════════════════════════════════════════════════════════
+// INGRESOS NETOS POR INTEGRANTE
+// GET /admin/equipo/:id/neto?periodo=dia|semana|mes
+//
+// Lo consume TeamManager (formulario de edición del miembro, debajo de
+// "Servicios que ofrece"). Mismo criterio de "turno contable" que el resto
+// del rendimiento (sin cancelados ni pendientes de aprobación).
+//
+//   bruto  = suma de precio_cobrado (lo que valen los turnos)
+//   neto   = bruto - comision_mp - comision_plataforma
+//
+// Las comisiones son las REALES que devolvió Mercado Pago en cada pago
+// (fee_details, guardadas en turnos.comision_mp / comision_plataforma), así que
+// ya reflejan el plazo de acreditación que tenga configurado cada negocio.
+// Los turnos en efectivo / transferencia no tienen comisión (neto = bruto).
+// Los turnos de MP anteriores a este cambio no tienen comisión guardada: se
+// cuentan sin descuento y se informan en `turnos_sin_comision`.
+//
+// Requiere (correr ANTES de desplegar este archivo):
+//   alter table turnos
+//     add column if not exists comision_mp numeric(12,2),
+//     add column if not exists comision_plataforma numeric(12,2);
+// ══════════════════════════════════════════════════════════════
+app.get("/admin/equipo/:id/neto", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!UUID_REGEX.test(id)) return res.status(400).json({ success: false, error: "Integrante inválido." });
+
+    const periodo = PERIODOS_RENDIMIENTO.includes(req.query.periodo) ? req.query.periodo : "mes";
+
+    const { data: miembro, error: miembroError } = await supabase.from("equipo")
+      .select("id, slug").eq("id", id).maybeSingle();
+    if (miembroError) throw miembroError;
+    // Mismo criterio que DELETE /admin/equipo/:id/servicios: no revelar si existe en otro negocio.
+    if (!miembro || (req.auth.rol !== "superadmin" && miembro.slug !== req.auth.slug)) {
+      return res.status(404).json({ success: false, error: "Integrante no encontrado." });
+    }
+
+    const { desde, hasta } = rangoPeriodoArg(periodo);
+
+    const turnos = [];
+    for (let pagina = 0; pagina < 20; pagina++) {
+      const { data: lote, error: turnosError } = await supabase.from("turnos")
+        .select("id, estado, precio_cobrado, metodo_pago, comision_mp, comision_plataforma")
+        .eq("slug", miembro.slug).eq("equipo_id", id)
+        .gte("fecha", desde).lte("fecha", hasta)
+        .neq("estado", "cancelado")
+        .order("id", { ascending: true })
+        .range(pagina * 1000, pagina * 1000 + 999);
+      if (turnosError) throw turnosError;
+      turnos.push(...(lote || []));
+      if (!lote || lote.length < 1000) break;
+    }
+
+    let bruto = 0, comisionMp = 0, comisionPlataforma = 0, sinComision = 0, cantidad = 0;
+    for (const t of turnos) {
+      if (t.estado === "pendiente") continue;
+      cantidad += 1;
+      bruto              += Number(t.precio_cobrado || 0);
+      comisionMp         += Number(t.comision_mp || 0);
+      comisionPlataforma += Number(t.comision_plataforma || 0);
+      if (t.metodo_pago === "mercadopago" && t.comision_mp == null) sinComision += 1;
+    }
+
+    const r2 = (n) => Math.round(n * 100) / 100;
+    res.json({
+      success: true,
+      periodo, desde, hasta,
+      turnos: cantidad,
+      bruto: r2(bruto),
+      comision_mp: r2(comisionMp),
+      comision_plataforma: r2(comisionPlataforma),
+      neto: r2(bruto - comisionMp - comisionPlataforma),
+      turnos_sin_comision: sinComision,
+    });
+  } catch (e) {
+    console.error("Error en /admin/equipo/:id/neto:", e.message);
+    res.status(500).json({ success: false, error: "Error al calcular los ingresos netos." });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
 // SUPERADMIN — CRUD DE NEGOCIOS
 // ══════════════════════════════════════════════════════════════
 app.post("/superadmin/negocios", requireAdminKey, async (req, res) => {
@@ -5278,7 +5359,7 @@ app.get("/oauth-callback", async (req, res) => {
 // función solo procesa pagos de Mercado Pago, así que el canal real es
 // siempre "mercadopago"; lo que llega en tipo_cobro es lo que antes se
 // guardaba (mal) en la columna metodo_pago del turno.
-async function procesarPagoConfirmado({ slug, nombre, apellido, telefono, email, fecha, hora, servicio_id, servicio_nombre, equipo_id, equipo_nombre, monto, moneda, tipo_cobro, precio_servicio, payment_id, estado, porcentaje_sena, extras, monto_extras }) {
+async function procesarPagoConfirmado({ slug, nombre, apellido, telefono, email, fecha, hora, servicio_id, servicio_nombre, equipo_id, equipo_nombre, monto, moneda, tipo_cobro, precio_servicio, payment_id, estado, porcentaje_sena, extras, monto_extras, comision_mp, comision_plataforma }) {
   const { data: turnoExistente } = await supabase
     .from("turnos").select("id").eq("payment_id", String(payment_id)).maybeSingle();
   if (turnoExistente) { console.log(`⚠️ Pago ${payment_id} ya procesado, ignorando.`); return; }
@@ -5339,6 +5420,8 @@ async function procesarPagoConfirmado({ slug, nombre, apellido, telefono, email,
       porcentaje_sena: tipo_cobro === "sena" ? porcSena : null,
       tipo_cobro: tipo_cobro || null,
       metodo_pago: "mercadopago", pago_estado: pagoEstado, fecha_pago: new Date().toISOString(),
+      // Comisiones reales cobradas por MP en este pago (null = no se pudo leer). Base de los ingresos netos.
+      comision_mp: comision_mp ?? null, comision_plataforma: comision_plataforma ?? null,
       moneda: moneda || "ARS", estado: "confirmado", payment_id: String(payment_id),
     }]).select().single();
 
@@ -5415,12 +5498,13 @@ app.post("/webhook/mp", async (req, res) => {
 
       // 3) Releer el pago con el token del vendedor para confirmar estado/monto reales
       let finalPayData = payData;
+      let leidoConTokenVendedor = false;
       const tokenVendedor = userNegocio ? await obtenerTokenMpVigente(slug, userNegocio) : null;
       if (tokenVendedor) {
         try {
           const vendorRes  = await fetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, { headers: { Authorization: `Bearer ${tokenVendedor}` } });
           const vendorData = await vendorRes.json();
-          if (vendorData?.id) finalPayData = vendorData;
+          if (vendorData?.id) { finalPayData = vendorData; leidoConTokenVendedor = true; }
         } catch (e) {
           console.error("No se pudo releer el pago con token del vendedor, se usa data de plataforma:", e.message);
         }
@@ -5428,6 +5512,24 @@ app.post("/webhook/mp", async (req, res) => {
 
       const meta   = pendiente || finalPayData.metadata || {};
       const estado = finalPayData.status === "approved" ? "aprobado" : finalPayData.status === "pending" ? "pendiente" : "rechazado";
+
+      // Comisiones que se le descuentan al negocio (para mostrar ingresos NETOS).
+      // Solo se guardan si el pago se leyó con el token del vendedor: con el token
+      // de la plataforma MP puede no devolver la comisión de procesamiento y
+      // quedaría un neto inflado. Sin dato -> null (el panel lo avisa).
+      // fee_payer "payer" (ej. financiación al cliente) no lo paga el negocio.
+      let comisionMp = null, comisionPlataforma = null;
+      if (leidoConTokenVendedor && Array.isArray(finalPayData.fee_details)) {
+        comisionMp = 0; comisionPlataforma = 0;
+        for (const f of finalPayData.fee_details) {
+          if (f?.fee_payer === "payer") continue;
+          const monto = Number(f?.amount || 0);
+          if (f?.type === "application_fee") comisionPlataforma += monto;
+          else comisionMp += monto;
+        }
+        comisionMp = Math.round(comisionMp * 100) / 100;
+        comisionPlataforma = Math.round(comisionPlataforma * 100) / 100;
+      }
 
       await procesarPagoConfirmado({
   slug,
@@ -5450,7 +5552,9 @@ app.post("/webhook/mp", async (req, res) => {
   payment_id:       paymentId,
   estado,
   extras: meta.extras || [],
-  monto_extras: meta.monto_extras || 0
+  monto_extras: meta.monto_extras || 0,
+  comision_mp: comisionMp,
+  comision_plataforma: comisionPlataforma
 });
 
       if (pendiente) {
