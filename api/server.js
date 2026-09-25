@@ -40,6 +40,11 @@ const PANEL_VERSION  = (process.env.PANEL_VERSION || "").trim();
 
 const DIAS_PRUEBA        = parseInt(process.env.DIAS_PRUEBA       || "30");
 const PRECIO_RENOVACION  = parseInt(process.env.PRECIO_RENOVACION || "22499");
+// Meta del logro "Facturaste $500 USD" (Tus logros, panel > Inicio). Se
+// fija en pesos porque es lo que factura el negocio; ~USD 500 al tipo de
+// cambio de referencia. Se compara contra la facturación histórica total
+// (pagos aprobados de todos los tiempos), no contra un período.
+const LOGRO_FACTURACION_META_ARS = parseInt(process.env.LOGRO_FACTURACION_META_ARS || "600000");
 const MP_PLATFORM_TOKEN  = process.env.MP_PLATFORM_TOKEN          || "";
 // FIX-SEC: secret propio para validar la firma de los webhooks de MP.
 const MP_WEBHOOK_SECRET  = process.env.MP_WEBHOOK_SECRET          || "";
@@ -4125,7 +4130,8 @@ const turnosHoyDetalle = turnosData
     }));
 
     const { data: todosLosTurnos } = await supabase.from("turnos")
-      .select("telefono, email, created_at, fecha, hora, estado").eq("slug", slug).neq("estado", "cancelado");
+      .select("telefono, email, created_at, fecha, hora, estado, monto_pagado, pago_estado")
+      .eq("slug", slug).neq("estado", "cancelado");
     const inicioMesDate = new Date(inicioMes + "T00:00:00");
 
     // Métricas de clientes reales.
@@ -4162,9 +4168,52 @@ const turnosHoyDetalle = turnosData
         }
       }
     });
+    let clientesFieles = 0; // 5 o más turnos históricos: logro "Cliente fiel"
     Object.values(conteoPorCliente).forEach((cantidad) => {
       if (cantidad >= 3) clientesFrecuentes++;
+      if (cantidad >= 5) clientesFieles++;
     });
+
+    // ── "Tus logros" (panel > Inicio): a diferencia de turnosMes/turnosHoy
+    // (que son del mes/día en curso y se reinician solos), estos salen de
+    // TODO el historial del negocio, para que un logro ganado no se "pierda"
+    // al cambiar el mes o el día. Se excluyen pendientes, mismo criterio de
+    // "turno contable" que el resto del panel.
+    const turnosLogros      = (todosLosTurnos || []).filter((t) => t.estado !== "pendiente");
+    const turnosHistoricos  = turnosLogros.length;
+
+    const turnosPorDia = {};
+    turnosLogros.forEach((t) => {
+      turnosPorDia[t.fecha] = (turnosPorDia[t.fecha] || 0) + 1;
+    });
+    const maxTurnosPorDia = Object.values(turnosPorDia).reduce((max, n) => Math.max(max, n), 0);
+
+    const diasSemanaConTurno = new Set(
+      turnosLogros.map((t) => new Date(`${t.fecha}T12:00:00`).getDay())
+    ).size; // 0 a 7: cuántos días distintos de la semana tuvieron al menos un turno
+
+    const facturacionHistorica = turnosLogros.reduce(
+      (acc, t) => acc + (t.pago_estado === "aprobado" ? Number(t.monto_pagado || 0) : 0),
+      0
+    );
+
+    // Programa de afiliados: ¿ya completó al menos un grupo de referidos
+    // (los 3 invitados llegaron a los turnos mínimos y cobraron el premio)?
+    // Lectura liviana (sin recalcular ni entregar premios, eso lo hace
+    // evaluarGrupoReferidos); alcanza con mirar si algún grupo ya quedó
+    // completo en su momento.
+    let programaAfiliadosCompleto = false;
+    const { data: referidosPropios } = await supabase.from("referidos")
+      .select("grupo_nro, premio_entregado_at").eq("referidor_slug", slug);
+    if (referidosPropios && referidosPropios.length) {
+      const gruposPorNro = {};
+      referidosPropios.forEach((r) => {
+        (gruposPorNro[r.grupo_nro] || (gruposPorNro[r.grupo_nro] = [])).push(r);
+      });
+      programaAfiliadosCompleto = Object.values(gruposPorNro).some(
+        (miembros) => miembros.length >= REFERIDOS_GRUPO_SIZE && miembros.every((m) => m.premio_entregado_at)
+      );
+    }
 
     // El panel grafica ingresos de los últimos 7/30 días y arma un sparkline: si
     // solo se mandaba el mes en curso, en los primeros días del mes todo lo
@@ -4238,6 +4287,17 @@ const turnosHoyDetalle = turnosData
       clientesNuevosMesAnterior: clientesNuevosMesAnterior,
       clientesRecurrentes:       clientesRecurrentes,
       clientesFrecuentes:        clientesFrecuentes,
+      // Histórico de todos los tiempos, usado por "Tus logros" en Inicio
+      // (a diferencia de los campos de arriba, estos nunca se reinician).
+      logros: {
+        turnosHistoricos,
+        clientesFieles,
+        maxTurnosPorDia,
+        diasSemanaConTurno,
+        facturacionHistorica,
+        facturacionMeta:        LOGRO_FACTURACION_META_ARS,
+        programaAfiliadosCompleto,
+      },
       serviciosMasPedidos,
       diasRecurrentes,
       comparativas,
