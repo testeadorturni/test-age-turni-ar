@@ -823,6 +823,42 @@ app.get("/comisiones-turnits/:slug", requireAuth, async (req, res) => {
     if (userError) throw userError;
     if (!user) return res.status(404).json({ success: false, error: "Negocio no encontrado." });
 
+    const periodoActual = periodoArgentina();
+    const { desde, hasta } = rangoPeriodoArg("mes");
+    const [{ data: turnosMes, error: turnosError }, { data: comisionesOfflineMes, error: comisionesMesError }] = await Promise.all([
+      supabase.from("turnos")
+        .select("fecha, estado, pago_estado, metodo_pago, precio_cobrado, monto_pagado, comision_mp, comision_plataforma")
+        .eq("slug", slug).gte("fecha", desde).lte("fecha", hasta).neq("estado", "cancelado"),
+      supabase.from("turnits_comisiones")
+        .select("importe, estado").eq("slug", slug).eq("periodo", periodoActual).neq("estado", "anulada"),
+    ]);
+    if (turnosError) throw turnosError;
+    if (comisionesMesError) throw comisionesMesError;
+
+    let ingresoBruto = 0, ingresoMp = 0, ingresoMpConDetalle = 0, ingresoOffline = 0;
+    let comisionMpReal = 0, comisionTurnitsOnline = 0, turnosMpSinDetalle = 0, turnosMpConDetalle = 0;
+    for (const turno of turnosMes || []) {
+      if (turno.estado === "pendiente" || turno.pago_estado !== "aprobado") continue;
+      const montoCobrado = Number(turno.monto_pagado || 0);
+      ingresoBruto += montoCobrado;
+      comisionTurnitsOnline += Number(turno.comision_plataforma || 0);
+      if (turno.metodo_pago === "mercadopago") {
+        ingresoMp += montoCobrado;
+        if (turno.comision_mp == null) turnosMpSinDetalle++;
+        else {
+          turnosMpConDetalle++;
+          ingresoMpConDetalle += montoCobrado;
+          comisionMpReal += Number(turno.comision_mp || 0);
+        }
+      } else if (["efectivo", "transferencia"].includes(turno.metodo_pago)) {
+        ingresoOffline += montoCobrado;
+      }
+    }
+    const comisionTurnitsOfflineMes = (comisionesOfflineMes || []).reduce((sum, row) => sum + Number(row.importe || 0), 0);
+    const r2 = (n) => Math.round(n * 100) / 100;
+    const comisionTurnitsMes = comisionTurnitsOnline + comisionTurnitsOfflineMes;
+    const totalComisionesMes = comisionMpReal + comisionTurnitsMes;
+
     const { data: cobroPendiente } = await supabase.from("turnits_comision_cobros")
       .select("id, importe, init_point, created_at").eq("slug", slug).eq("estado", "pendiente")
       .order("created_at", { ascending: false }).limit(1).maybeSingle();
@@ -832,6 +868,21 @@ app.get("/comisiones-turnits/:slug", requireAuth, async (req, res) => {
       ...estado,
       plan: user.plan || "gratis",
       periodo_actual: periodoArgentina(),
+      metricas_mes: {
+        desde, hasta,
+        ingreso_bruto: r2(ingresoBruto),
+        ingreso_mercado_pago: r2(ingresoMp),
+        ingreso_mercado_pago_con_detalle: r2(ingresoMpConDetalle),
+        ingreso_efectivo_transferencia: r2(ingresoOffline),
+        turnos_mp_con_detalle: turnosMpConDetalle,
+        comision_mercado_pago: r2(comisionMpReal),
+        comision_turnits_online: r2(comisionTurnitsOnline),
+        comision_turnits_efectivo_transferencia: r2(comisionTurnitsOfflineMes),
+        comision_turnits_total: r2(comisionTurnitsMes),
+        total_comisiones: r2(totalComisionesMes),
+        ingreso_neto_estimado: r2(ingresoBruto - totalComisionesMes),
+        turnos_mp_sin_detalle: turnosMpSinDetalle,
+      },
       cobro_pendiente: cobroPendiente || null,
       movimientos: estado.movimientos.map((m) => ({
         id: m.id, turno_id: m.turno_id, importe: Number(m.importe || 0),
