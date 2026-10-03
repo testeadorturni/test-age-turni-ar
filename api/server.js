@@ -2997,6 +2997,19 @@ app.post("/turnos/reservar-manual", limiterBooking, (req, res, next) => {
     }
     
     const { extras: extrasResueltos, montoExtras } = await resolverExtras(slugClean, servicio_id || null, extraIds);
+    const importeComisionTurnits = user.plan === "gratis"
+      ? calcularComisionTurnits(precioCobrado + montoExtras)
+      : 0;
+    const validacionComisionReserva = await validarReservasPorComisiones(slugClean, importeComisionTurnits);
+    if (!validacionComisionReserva.permitido) {
+      return res.status(403).json({
+        success: false,
+        error: validacionComisionReserva.codigo,
+        message: validacionComisionReserva.codigo === "comision_vencida"
+          ? "El negocio tiene un saldo de Turnits vencido y no puede recibir nuevas reservas."
+          : "El negocio alcanzó el límite de saldo de Turnits y no puede recibir nuevas reservas.",
+      });
+    }
 
     // FIX-SEÑA: el tipo de cobro (seña vs. total) es una configuración del
     // negocio (user.metodo_pago / user.porcentaje_sena), NO algo que
@@ -3039,6 +3052,26 @@ app.post("/turnos/reservar-manual", limiterBooking, (req, res, next) => {
       comprobante_path: comprobantePath,
     }]).select().single();
     if (turnoError) throw turnoError;
+
+    if (importeComisionTurnits > 0) {
+      const { error: comisionError } = await supabase.from("turnits_comisiones").insert([{
+        slug: slugClean,
+        turno_id: turno.id,
+        telefono_negocio: user.telefono || null,
+        nombre_negocio: user.business_name || slugClean,
+        fecha_turno: fecha,
+        servicio: servicioNombre || "Turno",
+        metodo_pago,
+        base_calculo: precioCobrado + montoExtras,
+        tasa: TURNITS_COMISION_TASA,
+        importe: importeComisionTurnits,
+        periodo: periodoArgentina(),
+      }]);
+      if (comisionError) {
+        await supabase.from("turnos").delete().eq("id", turno.id).eq("slug", slugClean);
+        throw comisionError;
+      }
+    }
 
     if (APPS_SCRIPT_URL) {
   fetch(APPS_SCRIPT_URL, {
@@ -3239,23 +3272,32 @@ app.put("/turnos/:id", requireAuth, async (req, res) => {
 
     let comisionManualNueva = 0;
     let usuarioComision = null;
+    let comisionExistenteManual = null;
     if (esAprobacionManual) {
       const { data: negocioComision, error: negocioComisionError } = await supabase.from("usuarios")
         .select("plan, estado_suscripcion, telefono, business_name").eq("slug", slugClean).maybeSingle();
       if (negocioComisionError) throw negocioComisionError;
       usuarioComision = negocioComision;
       if (negocioComision?.plan === "gratis") {
-        comisionManualNueva = calcularComisionTurnits(turnoExistente.precio_cobrado);
-      }
-      const validacionComision = await validarReservasPorComisiones(slugClean, comisionManualNueva);
-      if (!validacionComision.permitido) {
-        return res.status(403).json({
-          success: false,
-          error: validacionComision.codigo,
-          message: validacionComision.codigo === "comision_vencida"
-            ? "No se puede confirmar el turno porque hay un saldo de Turnits vencido. Pagalo desde Comisiones y deudas."
-            : "Este turno supera el límite de saldo de Turnits. Pagá lo acumulado desde Comisiones y deudas para seguir confirmando reservas.",
-        });
+        const { data: comision, error: comisionLookupError } = await supabase.from("turnits_comisiones")
+          .select("id, estado").eq("turno_id", turnoExistente.id).maybeSingle();
+        if (comisionLookupError) throw comisionLookupError;
+        comisionExistenteManual = comision;
+        // En reservas nuevas el saldo ya se genera al agendar. Este fallback
+        // completa reservas anteriores al cambio o reactivadas tras anularse.
+        if (!comision || comision.estado === "anulada") {
+          comisionManualNueva = calcularComisionTurnits(turnoExistente.precio_cobrado);
+          const validacionComision = await validarReservasPorComisiones(slugClean, comisionManualNueva);
+          if (!validacionComision.permitido) {
+            return res.status(403).json({
+              success: false,
+              error: validacionComision.codigo,
+              message: validacionComision.codigo === "comision_vencida"
+                ? "No se puede confirmar el turno porque hay un saldo de Turnits vencido. Pagalo desde Comisiones y deudas."
+                : "Este turno supera el límite de saldo de Turnits. Pagá lo acumulado desde Comisiones y deudas para seguir confirmando reservas.",
+            });
+          }
+        }
       }
     }
 
@@ -3299,16 +3341,13 @@ app.put("/turnos/:id", requireAuth, async (req, res) => {
         importe: comisionManualNueva,
         periodo: periodoArgentina(),
       };
-      const { data: comisionExistente, error: consultaComisionError } = await supabase
-        .from("turnits_comisiones").select("id, estado").eq("turno_id", turnoExistente.id).maybeSingle();
-      if (consultaComisionError) throw consultaComisionError;
       let comisionError = null;
-      if (comisionExistente?.estado === "anulada") {
+      if (comisionExistenteManual?.estado === "anulada") {
         const { error } = await supabase.from("turnits_comisiones").update({
           ...datosComision, estado: "pendiente", annulled_at: null, paid_at: null, cobro_id: null,
-        }).eq("id", comisionExistente.id);
+        }).eq("id", comisionExistenteManual.id);
         comisionError = error;
-      } else if (!comisionExistente) {
+      } else if (!comisionExistenteManual) {
         const { error } = await supabase.from("turnits_comisiones").insert([datosComision]);
         comisionError = error;
       }
